@@ -1,0 +1,10 @@
+These versions are known to run the notebooks:
+
+Julia                       v1.5.4      v1.6.1
+Catlab                      v0.11.2
+AlgebraicDynamics           v0.1.2
+DifferentialEquations       v6.17.1
+Plots                       v1.15.2     v1.16.3 
+Graphviz                    v2.47.0
+LaTeXStrings                v1.2.1
+
