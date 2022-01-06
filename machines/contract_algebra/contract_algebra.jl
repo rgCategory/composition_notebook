@@ -323,6 +323,6 @@ function DWDDynam.ODEProblem(m::ContractMachine{T}, u0::AbstractVector, xs::Abst
 end
 
 #-- Information accesible by using module
-export ContractTable, ContractMachine, oapply, failureInterval, check_contract, ODEProblem
+export ContractMachine, oapply, check_contract, ODEProblem
 
 end
