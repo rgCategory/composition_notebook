@@ -1,2 +1,2 @@
-# Pullback
-This file contrains attempts at reproducing the pullback found in Appendix B of "Categorical Semantics".
+# State Machines
+This folder contains implementations for different types of state machines. It also includes an implementation of static contracts.

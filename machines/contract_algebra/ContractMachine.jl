@@ -1,13 +1,24 @@
-module StaticContract
+module StaticContractMachine
 
 #-- Required modules
-using DifferentialEquations
+    # Wiring diagrams
 using AlgebraicDynamics
 using AlgebraicDynamics.DWDDynam
 using Catlab.WiringDiagrams
+import AlgebraicDynamics: oapply
+
+    # ode solver
+using DifferentialEquations
+import DifferentialEquations: ODEProblem
+
+    # Contract display
 using IntervalSets
 using PrettyTables
 using Printf
+
+    # Static contracts
+include("StaticContracts.jl")
+using .StaticContracts
 
 #-- datatypes used by contract machine
 const ContractOutputTable = Dict{KEY, NamedTuple{ (:input, :output), 
@@ -27,37 +38,37 @@ end
 
 #-- Contracts are defined via intervals
 struct ContractMachine{T<:Real}
-    cinput::Vector{Interval}
-    coutput::Vector{Interval}  
+    static_contract::StaticContract{T}
     machine::AbstractMachine{T}
     fcontract::Function  
     
     # inner constructor
-    function ContractMachine{T}(cinput::Vector, coutput::Vector, machine::AbstractMachine{T}; 
-                                fcontract = nothing) where T<:Real
-        # cannot have empty contract
-        for contract in [cinput; coutput]
-            if isempty(contract)
-                error("the interval $c is backwards")
-            end
-        end
-                
+    function ContractMachine{T}(static_contract::StaticContract{T}, machine::AbstractMachine{T}; 
+                                fcontract = nothing) where T<:Real                
         # contract function 
-        if fcontract == nothing     # Only define function in none is provided, used to not overwrite the composed function from oapply
+            # Only define function in none is provided, used to not overwrite the composed function from oapply
+        if fcontract == nothing     
             fcontract = (u::AbstractVector, x::AbstractVector, p=nothing, t=0) -> begin
-                Rin = map( (xin,cont) -> xin in cont, x, cinput )                           # check whether contracts at input ports are satisfied
-                Rout = map( (rout,cont) -> rout in cont, readout(machine)(u, p, t), coutput )      # check whether contracts at output ports are satisfied
+                # check whether contracts at input ports are satisfied
+                Rin = map( (xin,cont) -> xin in cont, x, static_contract.input )                   
+                
+                # check whether contracts at output ports are satisfied
+                Rout = map( (rout,cont) -> rout in cont, readout(machine)(u, p, t), static_contract.output )      
                 return ContractTable( (input = Rin, output = Rout) )
             end
         end
         # make a new machine satisfying these restrictions
-        new{T}(cinput, coutput, machine, fcontract)
+        new{T}(static_contract, machine, fcontract)
     end
 end
 
 # outer constructor
-function ContractMachine{T}(cinput::Vector, nstates::Int, coutput::Vector, dynamics::Function, readout::Function; 
+function ContractMachine{T}(cinput::Vector, nstates::Int, coutput::Vector, 
+                            dynamics::Function, readout::Function; 
                             fcontract = nothing, mtype = :continuous) where T<:Real
+    # contracts
+    static_contract = StaticContract{T}(cinput, coutput)
+    
     # each element in the vectors is a contract for the port on a box
     ninputs = length(cinput)
     noutputs = length(coutput)
@@ -69,65 +80,17 @@ function ContractMachine{T}(cinput::Vector, nstates::Int, coutput::Vector, dynam
         machine = DiscreteMachine{T}(ninputs, nstates, noutputs, dynamics, readout)
     end
     # make a machine using inner constructor
-    ContractMachine{T}(cinput, coutput, machine, fcontract=fcontract )
+    ContractMachine{T}(static_contract, machine, fcontract=fcontract )
 end
 
 #-- Compose multiple contract machines --
 
-function DWDDynam.oapply(d::WiringDiagram, ms::Vector{ContractMachine{T}}) where T<:Real
-    # ensure there is one machine for each box in the diagram
-    if nboxes(d) != length(ms)
-        error("there are $nboxes(d) boxes but $length(ms) machines")
-    end
-    
-    # store the name of the wires going entering and exiting each box
-    input_port = Array{Vector}(undef, nboxes(d))
-    output_port  = Array{Vector}(undef, nboxes(d))
-    
-    for id in 1:nboxes(d)
-        input_port[id] = input_ports(d, id)
-        output_port[id] = output_ports(d, id)
+function oapply(d::WiringDiagram, ms::Vector{ContractMachine{T}}) where T<:Real
+    # compose contracts
+    static_contract = StaticContracts.oapply(d, map(m -> m.static_contract, ms))
         
-        # ensure each wire is assigned a contract interval
-        if ( length(input_port[id]) != ninputs(ms[id].machine) || 
-             length(output_port[id]) != noutputs(ms[id].machine) )
-            error("number of ports do not match number of contracts at box $id")
-        end
-    end
-    
-    # check all of the wires inside the diagram (these exclude wires that enter or exit the diagram)
-    boxs = boxes(d)     # boxes in diagram
-    
-    for w in wires(d, :Wire)   
-        # ensure target and source name match. See Categorical Semantics p.16
-        t_var = boxs[w.target.box].input_ports[w.target.port]
-        s_var = boxs[w.source.box].output_ports[w.source.port]
-            
-        if t_var != s_var
-            error("variable names do not match at $w")
-        end
-        
-        # the name of the source and target box
-        s_name = boxs[w.source.box].value
-        t_name = boxs[w.target.box].value
-        
-        # check whether the output contract of the source is compatible with the input contract of the target
-        cout = ms[w.source.box].coutput[w.source.port]
-        cin = ms[w.target.box].cinput[w.target.port]
-        overlap = intersect(cout, cin)
-
-        if isempty(overlap) == true
-            error("the contract $cout of $s_name does not satisfy the contract $cin of $t_name at wire $t_var")
-        elseif overlap != cout
-            @warn("contract $cout of $s_name is undefined at the contract $cin of $t_name at wire $t_var")
-        end
-    end
-    
-    # store the contracts of the wires entering and exiting the digram
-    cinput = map(w -> ms[w.target.box].cinput[w.target.port], wires(d, :InWire))
-    coutput = map(w -> ms[w.source.box].coutput[w.source.port], wires(d, :OutWire))
-    
-    # get the initial index of the state vector of each each box. The composition concatenates these vectors into a single column.
+    # Get the initial index of the state vector of each each box. 
+    # The composition concatenates these vectors into a single column.
     nstate = 0
     index = Array{ UnitRange{Int} }(undef, nboxes(d))
     
@@ -142,7 +105,7 @@ function DWDDynam.oapply(d::WiringDiagram, ms::Vector{ContractMachine{T}}) where
     #---- Evaluate contracts           
     function fcontract(u::AbstractVector, x::AbstractVector, p=nothing, t=0) 
         # get the output of each box
-        rout = map( id -> readout(ms[id].machine)( u[index[id]], p, t ), 1:nboxes(d) ) # readout function needs to accept time and parameters.
+        rout = map( id -> readout(ms[id].machine)( u[index[id]], p, t ), 1:nboxes(d) ) 
         
         # evaluate the contract function
         fout = Array{Dict}(undef, nboxes(d))
@@ -164,8 +127,8 @@ function DWDDynam.oapply(d::WiringDiagram, ms::Vector{ContractMachine{T}}) where
             
             # for atomic boxes, assign the box name to the inputs and outputs
             if typeof(foutput) <: NamedTuple
-                fout[id] = Dict(name[id] => (input = input_port[id] .=> foutput.input, 
-                                              output = output_port[id] .=> foutput.output))
+                fout[id] = Dict(name[id] => (input = input_ports(d, id) .=> foutput.input, 
+                                              output = output_ports(d, id) .=> foutput.output))
             else    # for nested boxes, append the name of the parent box to the child boxes 
                 fout[id] = Dict( (name[id] .=> keys(foutput)) .=> values(foutput) )
             end
@@ -178,10 +141,8 @@ function DWDDynam.oapply(d::WiringDiagram, ms::Vector{ContractMachine{T}}) where
     machine = DWDDynam.oapply(d, map(m -> m.machine, ms))
     
     # return the composed machine
-    return ContractMachine{T}(cinput, coutput, machine, fcontract=fcontract)
+    return ContractMachine{T}(static_contract, machine, fcontract=fcontract)
 end
-
-#---------
 
 # Identify during which time intervals a signal is zero [false == contract is violated]
 function failureInterval(arr::AbstractVector, time=nothing, out_type="time")
@@ -220,22 +181,23 @@ function check_contract(sol::T1, machine::ContractMachine{T2}, x0::AbstractVecto
     # evalutate the contract function throughout time interval 
     fout = map( t -> machine.fcontract(sol(t), x0, p, t), sol.t )
     
-    # store time at which each contract fails for each box directory
-    set0 = fout[begin].table	# Initial evaluation of contracts. Used to get the names and wires of each box.
+    # Store time at which each contract fails for each box directory:
+        # Initial evaluation of contracts. Used to get the names and wires of each box.
+    set0 = fout[begin].table
     dict = Dict()    
     
-    for key in keys(set0)   # go through all directories
-	
+    # go through all directories
+    for key in keys(set0)   
+        # function to map indeces of contract outputs
         mapOut = index -> map(i -> set0[key][index][i].first => begin 
                                     # array of the contract state for each time step
                                     contract = map(set -> set.table[key][index][i].second, fout);
-
                                     # find the duration of 0's in the array
                                     failureInterval(contract, sol.t, out_type);                   
-                                end, 
-                        1:length( set0[key][index] ) )
-        
-        dict[key] = ( input=mapOut(:input), output=mapOut(:output) )    # store the times at the directory
+                                end,
+                           1:length(set0[key][index]) )
+        # store the times at the directory
+        dict[key] = ( input=mapOut(:input), output=mapOut(:output) )    
     end
     
     # output a data structure like that of fcontract but with failure intervals.
@@ -246,25 +208,7 @@ end
 
 # display contract machines as product of intervals
 function Base.show(io::IO, vf::ContractMachine)            
-    # Check all contracts
-    list = [vf.cinput; vf.coutput]
-    output = ""
-    
-    for contract in list
-        if -contract.left == contract.right == Inf
-            output *= "ℝ"
-        else
-            left = contract.left == -Inf ? "-∞" : contract.left
-            right = contract.right == Inf ? "∞"  : contract.right
-            output *= "[$left,$right]"
-        end
-        if contract != last(list) # fix for R x R
-            output *= " × "
-        end
-    end  
-    
-    # display combined string
-    print("ContractMachine( "*output*" )")
+    display(vf.static_contract)
 end
 
 # display contract tables (output of fcontract and eval_contract) as a pretty table
@@ -285,21 +229,24 @@ function Base.show(io::IO, data::ContractTable)
         box = string.(keys(dict))
         
         if typeof(dict) <: ContractOutputTable  # output of fcontract
-            mapOut = index -> map( x -> join( map(pair -> string(pair.first) * " : " * string(pair.second), x[index]), "\n"), values(dict) )
+            mapOut = index -> map( x -> join( 
+                                    map(pair -> string(pair.first) * " : " * string(pair.second), x[index]), "\n"),
+                            values(dict) )
             
             header =  ( ["box", "input", "output"], ["directory", "wire: contract", "wire: contract"] )
         
         else    # output of eval_contract
-            mapOut = index -> map( value -> begin 
+            mapOut = index::Symbol -> map( value -> begin 
                                     # make array with strings of time intervals for each box
                                         # Note: need way to change formatting for intergers
                                     out = map( pair -> 
                                                 map( set -> @sprintf("%s : %f , %f", pair.first, set...), pair.second ),
                                             value[index] );
-                                    
+
                                     # combine strings into large string seperated by line jumps
                                     join( vcat(out...), "\n") 
-                              end, values(dict) )
+                                end, 
+                            values(dict) )
                         
             header = ( ["box", "input", "output"], ["directory", "wire: failure interval", "wire: failure interval"] ) 
         end
@@ -313,16 +260,15 @@ end
 #-- helper functions
 
 # compose machines given the name of each box
-function DWDDynam.oapply(d::WiringDiagram, ms::Dict{Symbol, ContractMachine{T}}) where T<:Real
+function oapply(d::WiringDiagram, ms::Dict{Symbol, ContractMachine{T}}) where T<:Real
     oapply(d, map(box -> ms[box.value], boxes(d)) )
 end
 
 # solve the dynamics of the contract machines
-function DWDDynam.ODEProblem(m::ContractMachine{T}, u0::AbstractVector, xs::AbstractVector, tspan::Tuple, p=nothing) where T<:Real
-    DWDDynam.ODEProblem(m.machine, u0, xs, tspan, p)
+function ODEProblem(m::ContractMachine{T}, u0::AbstractVector, xs::AbstractVector, tspan::Tuple, p=nothing) where T<:Real
+    ODEProblem(m.machine, u0, xs, tspan, p)
 end
 
 #-- Information accesible by using module
 export ContractMachine, oapply, check_contract, ODEProblem
-
 end
